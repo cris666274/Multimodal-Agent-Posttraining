@@ -1,0 +1,46 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+outputs/
+
+# Model weights
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Generated training data (large, can be rebuilt from seed)
+data/sft/sft_agent_train_*.jsonl
+data/sft/sft_first_tool_*.jsonl
+data/sft/sft_full_trace_*.jsonl
+data/sft/sft_second_tool_*.jsonl
+data/sft/sft_chartqa*.jsonl
+data/sft/sft_docvqa*.jsonl
+data/sft/sft_cord*.jsonl
+
+# Backups
+*_backup.jsonl
+*_mock_backup.jsonl
+
+# External datasets (downloaded/empty)
+data/external/
+data/raw/
+data/sft/sft_ocrvqa.jsonl
+data/sft/sft_scienceqa.jsonl
+data/sft/sft_train.jsonl
+
+# Generated traces
+data/traces/
+
+# Generated v4 hard cases (can be rebuilt from eval)
+data/sft/sft_hard_*_v4.jsonl
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.egg-info/
+dist/
+build/

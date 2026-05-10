@@ -1,0 +1,1 @@
+发票必填字段：Invoice No, Date, Amount, Tax ID。缺少任一字段应判定为字段不完整。

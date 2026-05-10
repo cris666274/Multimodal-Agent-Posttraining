@@ -1,0 +1,33 @@
+'''
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+numpy<2
+accelerate
+transformers==4.46.3
+qwen-vl-utils
+pillow
+datasets
+tqdm
+gradio
+rich
+'''
+
+torch==2.7.0
+torchvision==0.22.0
+torchaudio==2.7.0
+transformers>=4.49.0
+accelerate
+qwen-vl-utils
+pillow
+peft
+datasets
+tqdm
+gradio
+rich
+
+'''
+pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+pip install -U "transformers>=4.49.0" accelerate qwen-vl-utils pillow datasets tqdm gradio rich
+'''
