@@ -1,0 +1,258 @@
+\documentclass[fontset=none,11pt,a4paper]{ctexart}
+\setCJKmainfont{AR PL SungtiL GB}[BoldFont=AR PL UMing CN,AutoFakeBold=2.5]
+\setCJKsansfont{AR PL UMing CN}
+\setCJKmonofont{AR PL UMing CN}
+\usepackage{geometry,booktabs,multirow,hyperref,enumitem,xcolor}
+\geometry{margin=2.2cm}
+\title{多模态Agent Post-Training中的\\优化方法分类与演化}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本项目同时涉及多模态大模型Post-Training和Agent Post-Training两个方向。本文对项目全过程中的所有优化尝试进行系统分类，阐明哪些属于多模态优化、哪些属于Agent优化、以及后续RL/GRPO方法在分类体系中的位置。核心结论：(1) 项目中唯一有效的优化全部来自多模态层面---真实VLM替代mock数据、模型规模从3B扩展到7B；(2) Agent层面的增量修补（DPO、增强数据、微调、refusal样本）全部失败或持平；(3) RL/GRPO将Agent优化提升到探索-最大化范式，同时通过reward函数将多模态质量也纳入优化目标，是突破当前瓶颈的最有希望方向。
+\end{abstract}
+
+\section{概念定义}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lp{5cm}p{5cm}}
+\toprule
+维度 & 多模态 Post-Training & Agent Post-Training \\
+\midrule
+\textbf{优化目标} & VLM对视觉输入的感知和理解质量 & 模型在工具调用多步决策链上的选择质量 \\
+\textbf{训练信号} & 图片→文字（OCR/描述/读数）的准确性 & 工具选择、格式纪律、答案恰当性 \\
+\textbf{典型数据} & 用户消息包含图片+问题 & 多轮对话：user→tool\_call→result→...→answer \\
+\textbf{关键指标} & OCR准确度、图表读数精度、视觉描述质量 & Tool Hit, Tool Order, Format Valid, Answer Keyword \\
+\textbf{优化方法} & 更好的VLM基座、真实VLM标注 & SFT模仿正确轨迹、DPO偏好优化、RL/GRPO \\
+\bottomrule
+\end{tabular}
+\caption{多模态Post-Training与Agent Post-Training的定义边界}
+\label{tab:definition}
+\end{table}
+
+关键区别：多模态优化关注\textbf{模型看到了什么}，Agent优化关注\textbf{模型看到了之后做什么}。
+
+\section{项目中所有优化尝试的分类}
+
+\subsection{多模态优化}
+
+\subsubsection{核心优化：真实VLM替代Mock数据}
+
+\textbf{改动}：训练数据中的vision\_parse结果从人工构造模板替换为真实Qwen-VL推理输出。
+
+\begin{itemize}[nosep]
+    \item Seed数据（46张图片）：mock OCR如``OCR结果：Invoice No=INV-1001''替换为真实VLM输出如``INVOICE\textbackslash nInvoice No: INV-1001\textbackslash nDate: 2026-04-01''
+    \item 外部数据集（751张图片）：ChartQA/DocVQA/CORD的占位文本（``图表已解析；请结合图表视觉证据...''）替换为真实VLM读取的数值和文本
+\end{itemize}
+
+\textbf{分类}：纯多模态优化。不改Agent决策逻辑，不改工具调用链，只改视觉输入的标注质量。
+
+\textbf{效果}：V4 keyword从72\%提升至82\%（eval修正后），这是全项目最大的单次提升。7B上document\_validation从10/15升至15/15。
+
+\subsubsection{模型规模提升：3B→7B}
+
+\textbf{改动}：基座模型从Qwen2.5-VL-3B-Instruct换为Qwen2.5-VL-7B-Instruct。
+
+\textbf{分类}：纯多模态优化。7B的视觉编码器更强大，OCR和图表理解能力天然更强。Agent逻辑（工具调用格式）通过相同的SFT数据学习，不受模型规模直接影响。
+
+\textbf{效果}：document\_validation 10/15→15/15，image\_text\_consistency 9/12→12/12。但在Agent侧的tool hit从100\%降至92\%---更大模型的视觉理解提升伴随工具纪律下降。
+
+\subsubsection{图片分辨率限制：Resize}
+
+\textbf{改动}：外部数据集图片从原始大小（最大7.4MB）压缩到最长1024px。
+
+\textbf{分类}：多模态优化（虽然是负向折衷）。本质是视觉信息量与GPU显存的权衡。48GB仍无法用原图训练7B，这是多模态Agent训练的硬件瓶颈。
+
+\textbf{效果}：训练可行但丢失了原图中的细粒度视觉信息。
+
+\subsection{Agent优化}
+
+\subsubsection{训练数据配比调整}
+
+\textbf{改动}：v3→v4期间调整recovery\_repeat(2→1)、python\_exec\_repeat(5→2)、retrieve\_docs\_repeat(5→2)。
+
+\textbf{分类}：Agent优化。不改变视觉输入质量，只改变工具调用分布的偏好。
+
+\textbf{效果}：v4达到3B工具纪律最佳状态（100\% tool hit），D类冗余调用从v3显著降低。
+
+\subsubsection{Enforcement机制}
+
+\textbf{改动}：在runtime.py中实现enforce\_required\_tools---模型输出final\_answer时检查是否漏调必需工具，漏了就拦截并给纠正提示。
+
+\textbf{分类}：Agent优化（inference-time，非训练）。强制模型遵循工具调用流程。
+
+\textbf{效果}：V2的tool hit从50\%升至100\%。但其副作用在V7B上暴露---enforcement阻碍了模型正确的"跳过vision\_parse直接识别品牌"行为。
+
+\subsubsection{DPO偏好优化（失败）}
+
+\textbf{改动}：三次DPO尝试---单轮64对、多轮13对、低lr微调。
+
+\textbf{分类}：Agent优化。试图优化最终答案的偏好（拒答 vs 猜测、完整答案 vs 简略）。
+
+\textbf{效果}：全部导致格式崩溃（tool hit跌至14-60\%）。DPO在严格格式约束下失效。
+
+\textbf{失败原因}：DPO的last-turn log-prob优化与Agent的多轮决策链结构不兼容。
+
+\subsubsection{增强训练数据（V5/V6/V8/V9）}
+
+\textbf{改动}：
+\begin{itemize}[nosep]
+    \item V5: +818条多样问法、推理链、纠错轨迹
+    \item V6: 修refusal模板（从假模板换为真实VLM输出）
+    \item V8: +53条工具决策样本（47条直接回答+6条refusal+tool）
+    \item V9: +推理前缀版工具决策样本
+\end{itemize}
+
+\textbf{分类}：Agent优化。试图通过多样化数据教模型工具选择的边界。
+
+\textbf{效果}：V5持平(82\%)、V6退步(70\%)、V8大幅退步(50\%)、V9未完成。所有Agent增量修补均无效。
+
+\textbf{失败原因}：单阶段SFT无法同时优化格式纪律和工具选择灵活性。
+
+\subsubsection{7B的LoRA Rank搜索}
+
+\textbf{改动}：7B上测试r=16、r=32、r=64。
+
+\textbf{分类}：Agent优化（通过模型容量影响工具学习质量）。
+
+\textbf{效果}：r=16崩溃(14\%)、r=32成功(92\%)、r=64崩溃(16\%)。存在一个窄的最优区间。
+
+\subsection{分类汇总}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{llcc}
+\toprule
+优化尝试 & 分类 & 有效？ & 效果量级 \\
+\midrule
+Mock→真实VLM & 多模态 & \checkmark & +10\% kw \\
+3B→7B & 多模态 & \checkmark & doc+5/15, img+3/12 \\
+原图→Resize & 多模态(折衷) & \checkmark & 训练可行 \\
+\addlinespace
+数据配比调整(v3→v4) & Agent & \checkmark & 100\% tool \\
+Enforcement & Agent & \checkmark & +50\% tool hit(v2) \\
+\addlinespace
+DPO & Agent & \ding{55} & 格式崩溃 \\
+V5增强数据 & Agent & \ding{55} & 持平 \\
+V6修refusal & Agent & \ding{55} & 退步 \\
+V8工具决策 & Agent & \ding{55} & 大幅退步 \\
+V9推理前缀 & Agent & \ding{55} & 未完成 \\
+7B rank搜索 & Agent(架构) & \checkmark/\ding{55} & r=32有效 \\
+\bottomrule
+\end{tabular}
+\caption{所有优化尝试的分类与结果。``多模态''指仅涉及视觉输入质量，``Agent''指涉及工具调用决策。}
+\label{tab:classification}
+\end{table}
+
+\section{核心洞察}
+
+\subsection{多模态优化一致有效}
+
+\textbf{每一次多模态层面的优化都带来正向收益。} 真实VLM替代mock、3B换7B---这两个改动贡献了全项目80\%以上的提升。这指向一个基础性结论：
+
+\begin{center}
+\fbox{\parbox{0.85\textwidth}{
+对于VLM Agent，\textbf{视觉理解能力是Agent能力的地板。}\\
+模型能看清图片里的字，自然知道该做什么；\\
+看不清的时候，再好的Agent策略也没用。
+}}
+\end{center}
+
+\subsection{Agent优化一致失败（增量修补范式）}
+
+\textbf{在已收敛的SFT模型上做任何Agent层面的增量修补都失败。} V5/V6/V8/V9/DPO×3---七个Agent优化尝试，无一次提升。
+
+这不是某一个补丁的问题，是\textbf{优化范式}的问题：
+
+\begin{itemize}[nosep]
+    \item 单阶段SFT将格式纪律、工具选择、答案质量、拒答边界压缩进一个loss
+    \item 模型到达的"SFT最优点"是四个目标的平衡点，不是任何单一目标的最优
+    \item 针对任一目标的修补都会打破平衡---且修复成本远超重建成本
+\end{itemize}
+
+\subsection{3B和7B的能力分布差异}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lccc}
+\toprule
+维度 & 3B (V4) & 7B (V7B-clean) & 差异来源 \\
+\midrule
+视觉理解 & 较弱 & \textbf{较强} & 多模态: 更大视觉编码器 \\
+工具纪律 & \textbf{较强} & 较弱 & Agent: 更小模型更专注格式 \\
+数据敏感性 & \textbf{低} & 极高 & Agent: 更大模型更易过拟合 \\
+\bottomrule
+\end{tabular}
+\caption{3B与7B在两类能力上的互补分布}
+\label{tab:3b7b}
+\end{table}
+
+3B和7B在两类能力上高度互补：3B的工具纪律好但视觉理解弱，7B的视觉理解强但工具纪律弱且对数据极度敏感。这一现象本身值得深入研究---为什么更大模型反而更难维持格式纪律？
+
+\section{后续优化：RL/GRPO的分类定位}
+
+\subsection{GRPO同时优化多模态和Agent}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lp{4cm}p{4cm}}
+\toprule
+ & SFT (当前) & RL/GRPO (后续) \\
+\midrule
+\textbf{范式} & 模仿: 我给正确轨迹, 你照着学 & 探索: 你自己试, 我打分 \\
+\textbf{多模态优化} & 间接: 通过标注质量提升 & \textbf{直接}: reward含OCR准确度 \\
+\textbf{Agent优化} & 固定: 数据怎么写模型怎么做 & \textbf{灵活}: 模型探索不同路径 \\
+\textbf{格式约束} & 靠数据分布 & \textbf{硬编码}进reward \\
+\textbf{目标冲突} & 四个目标抢一个loss & \textbf{加权求和}，显式tradeoff \\
+\bottomrule
+\end{tabular}
+\caption{SFT与RL在优化范式上的对比}
+\label{tab:sft_vs_rl}
+\end{table}
+
+GRPO的reward函数天然解耦多模态和Agent优化：
+
+\begin{verbatim}
+reward =
+  vision_quality  × 0.2   # 多模态: OCR/读数准确度
+  + tool_correct  × 0.3   # Agent: 工具选择
+  + format_valid  × 0.5   # Agent: 格式纪律
+  + answer_quality × 0.3  # Agent: 答案质量
+  - tool_redundant × 0.2  # Agent: 惩罚冗余调用
+\end{verbatim}
+
+\subsection{为什么GRPO能解决当前瓶颈}
+
+\begin{enumerate}[label=(\arabic*),nosep]
+    \item \textbf{格式天然保护}：format\_valid=-100 if parse\_error 作为硬约束写进reward。模型探索时不可能走格式不对的路径---不像DPO可以降低loss但丢掉格式。
+    \item \textbf{工具选择不再是二元模仿}：SFT固化了"每个任务必须走某个路径"。GRPO让模型探索多条路径，只要reward高就行。比如品牌识别可以直接回答(如果认识)也可以调vision\_parse再回答。模型通过采样发现哪些路径reward更高。
+    \item \textbf{多模态质量被纳入优化}：SFT无法区分"OCR是对的但Agent流程错了"和"OCR是错的但Agent流程对了"。GRPO的reward里vision\_quality项直接衡量视觉理解，让模型同时优化感知和决策。
+    \item \textbf{数据敏感性降低}：不需要精确配比"直接回答样本"和"工具调用样本"。模型通过reward自己探索边界。
+\end{enumerate}
+
+\subsection{GRPO的训练流程}
+
+\begin{enumerate}[nosep]
+    \item 用V4或V7B-clean作为base model（已具备基本的工具调用能力）
+    \item 对50条eval样本做rollout：让模型自由生成完整调用链
+    \item 根据reward函数对每条rollout打分
+    \item 用GRPO loss更新模型参数
+    \item 每轮采样新的rollout，迭代
+\end{enumerate}
+
+预计迭代5-10轮即可看到效果。与SFT的30+轮迭代相比，RL的采样效率更高（因为不需要人工构造数据，模型自己产出训练信号）。
+
+\section{结论}
+
+\begin{enumerate}[nosep]
+    \item 项目中\textbf{多模态优化全部有效}（真实VLM、7B升级），\textbf{Agent增量优化全部失败}（DPO、增强数据、微调）。
+    \item 失败不是某个补丁的问题，而是SFT作为优化范式在严格格式+多目标Agent任务上的天花板。
+    \item RL/GRPO是突破天花板的路径：它同时优化多模态和Agent两个维度，将格式硬编码为reward约束，让模型在格式安全区内自由探索最优策略。
+    \item 从方法演进看，Agent Post-Training的路径是：SFT建立基线 → DPO在数据充足时微调 → RL/GRPO解锁灵活性。当前项目卡在第一步和第二步之间。
+\end{enumerate}
+
+\end{document}

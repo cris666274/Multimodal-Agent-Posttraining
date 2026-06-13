@@ -97,21 +97,19 @@ def resolve_image_paths(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Log-probability helpers
+# Log-prob via HF model.forward().loss (auto-aligns visual tokens)
 # ---------------------------------------------------------------------------
 
-def compute_log_prob(
+def compute_log_prob_via_loss(
     model,
     processor,
     messages: List[Dict[str, Any]],
-    max_length: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """
-    Compute the total log-probability of the last assistant turn in `messages`.
-
-    Returns a scalar tensor (sum of token-level log-probs) that preserves
-    gradients when called on a trainable model.
+    Compute assistant turn log-prob using model.forward().loss.
+    HuggingFace internally handles visual token position mapping,
+    avoiding the VLM-specific token alignment bug.
     """
     device = model.device
 
@@ -127,54 +125,44 @@ def compute_log_prob(
     prefix = messages[:assistant_idx]
     full = messages[: assistant_idx + 1]
 
+    # Tokenize full sequence (no generation prompt at end)
     full_text = processor.apply_chat_template(
         full, tokenize=False, add_generation_prompt=False,
     )
+    full_img, full_vid = process_vision_info(full)
+    full_inputs = processor(
+        text=[full_text], images=full_img, videos=full_vid,
+        padding=False, return_tensors="pt",
+    ).to(device)
+
+    # Tokenize prefix to get assistant start position
     prefix_text = processor.apply_chat_template(
         prefix, tokenize=False, add_generation_prompt=True,
     )
-
-    full_img, full_vid = process_vision_info(full)
     prefix_img, prefix_vid = process_vision_info([prefix])
-
-    full_inputs = processor(
-        text=[full_text],
-        images=full_img,
-        videos=full_vid,
-        padding=False,
-        return_tensors="pt",
-    ).to(device)
-
     prefix_inputs = processor(
-        text=[prefix_text],
-        images=prefix_img,
-        videos=prefix_vid,
-        padding=False,
-        return_tensors="pt",
+        text=[prefix_text], images=prefix_img, videos=prefix_vid,
+        padding=False, return_tensors="pt",
     )
 
+    # Build labels: mask all tokens before assistant response
     prefix_len = prefix_inputs["input_ids"].shape[1]
-    full_ids = full_inputs["input_ids"][0]
+    labels = full_inputs["input_ids"].clone()
+    labels[:, :prefix_len] = -100
 
-    outputs = model(input_ids=full_inputs["input_ids"])
-    logits = outputs.logits[0]  # [seq_len, vocab_size]
-    log_probs = F.log_softmax(logits.float(), dim=-1)
+    # Forward pass with labels → HuggingFace computes loss over unmasked tokens
+    outputs = model(**full_inputs, labels=labels)
+    loss = outputs.loss  # average NLL over non-masked tokens
 
-    # Gather log-probs for assistant tokens
-    gathered = []
-    for t in range(prefix_len, full_ids.shape[0]):
-        token_id = full_ids[t].item()
-        if t > 0 and t - 1 < log_probs.shape[0]:
-            gathered.append(log_probs[t - 1, token_id])
+    # Convert back to total log-prob: logP = -loss * num_tokens
+    num_tokens = max((labels != -100).sum(), 1)
+    log_prob = -loss * num_tokens
 
-    if not gathered:
-        return torch.tensor(0.0, device=device)
-
-    return torch.stack(gathered).sum()
+    return log_prob
 
 
 # ---------------------------------------------------------------------------
-# DPO Trainer
+# DPO Trainer (fixed: uses HF labels-based loss, not manual logit alignment)
 # ---------------------------------------------------------------------------
 
 class DPOTrainer(Trainer):
@@ -196,12 +184,7 @@ class DPOTrainer(Trainer):
         self.compute_dtype = dtype
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """
-        Compute DPO loss for a batch.
-
-        inputs is a dict from the collator; we decode the raw samples
-        and compute log-probs on the fly.
-        """
+        """DPO loss using HF labels-based log-prob (no manual logit alignment)."""
         samples = inputs.get("samples", [])
         if not samples:
             return torch.tensor(0.0, device=model.device, requires_grad=True)
@@ -212,32 +195,27 @@ class DPOTrainer(Trainer):
             chosen_msgs = sample["chosen"]
             rejected_msgs = sample["rejected"]
 
-            # Build full conversations
             full_chosen = list(prompt_msgs) + list(chosen_msgs)
             full_rejected = list(prompt_msgs) + list(rejected_msgs)
 
             # Policy log-probs (differentiable)
-            chosen_lp = compute_log_prob(
-                model, self.processor, full_chosen,
-                self.max_length, self.compute_dtype,
+            chosen_lp = compute_log_prob_via_loss(
+                model, self.processor, full_chosen, self.compute_dtype,
             )
-            rejected_lp = compute_log_prob(
-                model, self.processor, full_rejected,
-                self.max_length, self.compute_dtype,
+            rejected_lp = compute_log_prob_via_loss(
+                model, self.processor, full_rejected, self.compute_dtype,
             )
 
             # Reference log-probs (frozen, no gradients)
             with torch.no_grad():
-                ref_chosen_lp = compute_log_prob(
-                    self.ref_model, self.processor, full_chosen,
-                    self.max_length, self.compute_dtype,
+                ref_chosen_lp = compute_log_prob_via_loss(
+                    self.ref_model, self.processor, full_chosen, self.compute_dtype,
                 )
-                ref_rejected_lp = compute_log_prob(
-                    self.ref_model, self.processor, full_rejected,
-                    self.max_length, self.compute_dtype,
+                ref_rejected_lp = compute_log_prob_via_loss(
+                    self.ref_model, self.processor, full_rejected, self.compute_dtype,
                 )
 
-            # DPO loss: all terms are tensors, policy terms carry gradients
+            # DPO loss
             log_ratio = (
                 self.dpo_beta
                 * (chosen_lp - ref_chosen_lp - rejected_lp + ref_rejected_lp)
@@ -330,15 +308,15 @@ def main():
     policy_model = get_peft_model(policy_model, lora_config)
     policy_model.print_trainable_parameters()
 
-    # --- Reference model (frozen: base + SFT adapter) ---
-    print("Loading reference model (SFT adapter)...")
+    # --- Reference model (frozen, on CPU to save GPU memory) ---
+    print("Loading reference model (SFT adapter, CPU)...")
     ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model_name,
-        torch_dtype=dtype,
-        device_map="auto",
+        torch_dtype=torch.float32,  # float32 on CPU
+        device_map="cpu",
     )
     ref_model = PeftModel.from_pretrained(ref_model, args.adapter_name)
-    ref_model = ref_model.merge_and_unload()  # merge SFT LoRA into base weights
+    ref_model = ref_model.merge_and_unload()  # merge on CPU, no GPU OOM
     ref_model.eval()
     for param in ref_model.parameters():
         param.requires_grad = False
@@ -362,6 +340,7 @@ def main():
         report_to="none",
         remove_unused_columns=False,
         dataloader_pin_memory=False,
+        max_grad_norm=1.0,
     )
 
     trainer = DPOTrainer(

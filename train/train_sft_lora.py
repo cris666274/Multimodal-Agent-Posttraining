@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from qwen_vl_utils import process_vision_info
 from torch.utils.data import Dataset
 from transformers import (
@@ -199,6 +199,11 @@ def parse_args():
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument(
+        "--adapter_name",
+        default=None,
+        help="Path to existing LoRA adapter to fine-tune from (instead of training from scratch).",
+    )
     return parser.parse_args()
 
 
@@ -224,6 +229,14 @@ def main():
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
+
+    # Load existing adapter for fine-tuning
+    if args.adapter_name:
+        print(f"Loading existing LoRA adapter for fine-tuning: {args.adapter_name}")
+        model = PeftModel.from_pretrained(model, args.adapter_name)
+        # Merge and reapply LoRA for continued training with fresh adapters
+        model = model.merge_and_unload()
+        print("Merged existing adapter. Applying fresh LoRA on top.")
 
     lora_config = LoraConfig(
         r=args.lora_r,

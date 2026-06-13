@@ -1,0 +1,100 @@
+# Multimodal Agent Posttraining — Experiment Config
+# 每次实验从这里 fork，保证可复现
+
+# ============================================================
+# Model
+# ============================================================
+model:
+  base: "/root/autodl-tmp/models/Qwen2.5-VL-3B-Instruct"
+  base_7b: "/root/autodl-tmp/models/Qwen2.5-VL-7B-Instruct"
+  lora_dir: "/root/autodl-tmp/multimodal-agent-lora"
+
+# ============================================================
+# LoRA hyperparameters
+# ============================================================
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+# ============================================================
+# Training
+# ============================================================
+training:
+  sft:
+    learning_rate: 2e-4
+    num_epochs: 3
+    batch_size: 1
+    gradient_accumulation_steps: 8
+    warmup_ratio: 0.03
+    max_length: 2048
+    bf16: true
+
+  dpo:  # 暂时搁置，用 rejection sampling 替代
+    learning_rate: 5e-5
+    num_epochs: 2
+    beta: 0.1
+
+  rejection_sampling:
+    num_rollouts: 8
+    max_steps: 6
+    criteria:
+      - exact_tool_match
+      - keyword_match
+      - refusal_correct
+      - format_valid
+
+# ============================================================
+# Data versions
+# ============================================================
+data:
+  sft:
+    v4_enforced: "data/sft/sft_agent_train_real_v4_enforced_resized.jsonl"  # 1133 samples, 3B
+    v7b_final: "data/sft/sft_agent_train_v7b_final.jsonl"                    # 1136 samples, 7B
+    v8_3b: "data/sft/sft_agent_train_v8_3b.jsonl"                            # 1186 samples
+    refusal: "data/sft/sft_refusal_train.jsonl"                               # 4 samples, refusal专项
+    format: "data/sft/sft_hard_format.jsonl"                                  # format repair
+    tool_decision: "data/sft/sft_tool_decision_v8.jsonl"                      # tool selection
+
+  dpo:
+    hard_cases: "data/preference/dpo_hard_cases.jsonl"
+    v4_multiturn: "data/preference/dpo_train_v4_mt.jsonl"
+
+  eval:
+    dev: "data/eval/eval_dev_v2.jsonl"      # 41 samples
+    test: "data/eval/eval_test.jsonl"        # 18 samples
+    expanded: "data/eval/expanded_eval.jsonl" # 59 samples (full)
+
+# ============================================================
+# SFT data mixing ratios (ordered by priority)
+# ============================================================
+sft_mix:
+  multi_turn_trace: 0.45    # 完整多轮 agent 轨迹
+  first_tool: 0.20           # 第一步工具选择
+  refusal: 0.15              # 拒绝/边界样本
+  tool_decision: 0.10        # 第二步工具决策
+  format_repair: 0.05        # 格式修复
+  direct_vqa: 0.05           # 直接回答（不调工具）
+
+# ============================================================
+# Evaluation
+# ============================================================
+eval:
+  metrics:
+    - tool_hit
+    - tool_order_hit
+    - format_valid
+    - answer_keyword_hit
+    - refusal_correct
+    - exact_tool_match
+    - over_call_rate
+    - missing_call_rate
+  fuzzy_numeric_tolerance: 0.005  # 数值模糊匹配容差

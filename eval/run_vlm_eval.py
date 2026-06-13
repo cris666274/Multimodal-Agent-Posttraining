@@ -62,7 +62,19 @@ def has_answer_keywords(answer, keywords):
     if not keywords:
         return True
     text = answer or ""
-    return all(keyword in text for keyword in keywords)
+    for keyword in keywords:
+        if keyword in text:
+            continue
+        # Fuzzy numeric match for chart values: "25.0" matches "25.00" or "25"
+        try:
+            val = float(keyword)
+            # Check if answer contains this value in any common format
+            patterns = [f"{val:.2f}", f"{val:.1f}", f"{val:.0f}", str(round(val))]
+            if not any(p in text for p in set(patterns)):
+                return False
+        except ValueError:
+            return False
+    return True
 
 
 def parse_args():
@@ -76,7 +88,6 @@ def parse_args():
     parser.add_argument("--out_path", default=str(OUT_PATH))
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--max_steps", type=int, default=6)
-    parser.add_argument("--use_mock", action="store_true")
     parser.add_argument(
         "--enforce_required_tools",
         type=bool,
@@ -107,7 +118,6 @@ def main():
         model_name=args.model_name,
         adapter_name=args.adapter_name,
         max_new_tokens=args.max_new_tokens,
-        use_mock=args.use_mock,
     )
     agent = MultimodalAgent(
         model=model,

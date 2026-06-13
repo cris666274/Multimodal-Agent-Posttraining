@@ -1,0 +1,57 @@
+# Final model configuration — Frozen
+#
+# Tier 1 (Best): Dual v3 + DPO Answerer
+#   Planner: V4 (lora_agent_real_v4)
+#   Answerer: V7B-DPO (lora_dpo_v3)
+#   Agent: agent/dual_agent.py (Dual v3 with over-call rules)
+#   Dev: 94% exact, 0 miss, 6 over
+#   Gold30: 87% exact, 97% Answer KW, 97% Refusal
+#   VRAM: 24 GB
+#
+# Tier 2 (Light): Hard Distilled 7B Single Model
+#   Model: lora_7b_distilled_sft (from base 7B, hard distillation)
+#   Agent: agent/runtime.py (with over-call reduction rules)
+#   Dev: 83% exact, 0 miss, 17 over
+#   VRAM: 16 GB
+#
+# Soft distillation (KD): 6 attempts, all failed
+#   - KL formula wrong (noise), prompt mismatch, KL gradient dominates CE
+#   - Hard distillation (teacher trajectories as SFT) works reliably
+
+model:
+  # Tier 1
+  dual:
+    planner:
+      base: "/root/autodl-tmp/models/Qwen2.5-VL-3B-Instruct"
+      adapter: "/root/autodl-tmp/multimodal-agent-lora/lora_agent_real_v4"
+    answerer:
+      base: "/root/autodl-tmp/models/Qwen2.5-VL-7B-Instruct"
+      adapter: "/root/autodl-tmp/multimodal-agent-lora/lora_dpo_v3"
+    agent: "agent/dual_agent.DualModelAgent"
+    vram: "24 GB"
+
+  # Tier 2
+  single:
+    base: "/root/autodl-tmp/models/Qwen2.5-VL-7B-Instruct"
+    adapter: "/root/autodl-tmp/multimodal-agent-lora/lora_7b_distilled_sft"
+    agent: "agent/runtime.MultimodalAgent"
+    vram: "16 GB"
+
+results:
+  # Dual v3 + DPO answerer
+  dual_v3_dpo:
+    dev_exact: "94%"
+    dev_miss: 0
+    dev_over: 6
+    gold30_exact: "87%"
+    gold30_kw: "97%"
+    gold30_refusal: "97%"
+
+  # Hard distilled 7B with over-call rules
+  single_distilled:
+    dev_exact: "83%"
+    dev_miss: 0
+    dev_over: 17
+    image_consistency_exact: "100%"
+    uncertainty_refusal_exact: "100%"
+    document_validation_exact: "100%"

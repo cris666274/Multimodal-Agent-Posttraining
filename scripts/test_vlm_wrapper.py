@@ -18,8 +18,7 @@ def main() -> int:
 
     model = QwenVLModel(
     model_name="/root/autodl-tmp/models/Qwen2.5-VL-3B-Instruct",
-    max_new_tokens=256,
-    use_mock=False,)
+    max_new_tokens=256,)
 
     messages = [
         {

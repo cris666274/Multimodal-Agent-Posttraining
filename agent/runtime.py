@@ -19,9 +19,7 @@ class MultimodalAgent:
         self.enforce_required_tools = enforce_required_tools
 
         # 将真实 VLM 模型注入 tools，使 vision_parse 使用真实推理
-        # mock 模式下不注入，避免循环调用
-        if not getattr(model, "use_mock", False):
-            set_vlm_model(model)
+        set_vlm_model(model)
 
     def build_initial_messages(self, image: str, question: str) -> List[Dict[str, Any]]:
         return [
@@ -41,6 +39,29 @@ class MultimodalAgent:
     @staticmethod
     def _called_tool_names(trace: List[Dict[str, Any]]) -> List[str]:
         return [item["tool_name"] for item in trace if "tool_name" in item]
+
+    @staticmethod
+    def _should_skip_second_tool(question, called_tools, vision_result, required):
+        """Check if 2nd tool can be skipped based on vision_parse results."""
+        skippable = []
+        if required == "retrieve_docs" and vision_result:
+            fields_en = ["Invoice No", "Date", "Amount", "Tax ID"]
+            fields_cn = ["发票号码", "日期", "金额", "税号"]
+            found_en = sum(1 for f in fields_en if f in vision_result)
+            found_cn = sum(1 for f in fields_cn if f in vision_result)
+            has_inv = "INV-" in vision_result or "TAX-" in vision_result
+            if (found_en >= 3 or found_cn >= 3 or has_inv) and \
+               ("缺少" not in question and "缺失" not in question and
+                "差异" not in question and "对比" not in question and
+                "合规" not in question and "符合" not in question):
+                skippable.append("retrieve_docs")
+        if required == "python_exec" and "vision_parse" in called_tools:
+            calc_keywords = ["增长率", "同比", "计算", "预测", "百分比",
+                           "差值", "增长", "总和", "趋势", "高出", "多少",
+                           "哪一年", "哪个", "比较"]
+            if not any(kw in question for kw in calc_keywords):
+                skippable.append("python_exec")
+        return skippable
 
     @staticmethod
     def _needs_vision_first(question: str, image: str) -> bool:
@@ -156,6 +177,7 @@ class MultimodalAgent:
         trace = []
         used_tool_calls = set()
         blocked_tools: set = set()
+        last_vision_result = ""
 
         for step in range(self.max_steps):
             model_output = self.model.generate(messages)
@@ -211,6 +233,11 @@ class MultimodalAgent:
                     question=question,
                     called_tool_names=called_tool_names,
                 )
+                # Allow skip if vision_parse result is sufficient
+                skippable = self._should_skip_second_tool(
+                    question, called_tool_names, last_vision_result, required_tool)
+                if required_tool in skippable:
+                    required_tool = ""
                 if self.enforce_required_tools and required_tool:
                     trace.append(
                         {
@@ -358,6 +385,8 @@ class MultimodalAgent:
                 else:
                     try:
                         observation = TOOLS[tool_name](**tool_args)
+                        if tool_name == "vision_parse":
+                            last_vision_result = str(observation.get("result", ""))
                     except Exception as e:
                         observation = {
                             "error": f"工具执行失败：{e}",
@@ -387,8 +416,27 @@ class MultimodalAgent:
                     f"工具 {tool_name} 返回结果如下：",
                     f"{json.dumps(observation, ensure_ascii=False)}",
                     "",
-                    "请根据工具结果继续完成原始任务。",
                 ]
+
+                # Over-call reduction: check if 2nd tool can be skipped
+                if tool_name == "vision_parse":
+                    called_tool_names = self._called_tool_names(trace)
+                    required = self._required_tool_after_vision(question, called_tool_names)
+                    skippable = self._should_skip_second_tool(
+                        question, called_tool_names,
+                        str(observation.get("result", "")), required)
+
+                    if skippable:
+                        post_tool_lines.append(
+                            f"重要：vision_parse 已经返回了足够的信息。"
+                            f"不需要再调用 {', '.join(skippable)}。"
+                            f"请直接输出 <final_answer>最终答案</final_answer>。"
+                            f"不要再输出 <tool_call>。"
+                        )
+                    else:
+                        post_tool_lines.append("请根据工具结果继续完成原始任务。")
+                else:
+                    post_tool_lines.append("请根据工具结果继续完成原始任务。")
 
                 # 如果当前刚调完 vision_parse，且之前有工具被阻断过，显式提醒
                 still_blocked = [

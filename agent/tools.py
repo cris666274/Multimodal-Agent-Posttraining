@@ -8,10 +8,11 @@ python_exec:   安全 Python 数学表达式执行。
 """
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS_DIR = ROOT / "data" / "docs"
@@ -67,60 +68,122 @@ def _load_rules() -> Dict[str, str]:
 # retrieve_docs：真实规则文档检索
 # ---------------------------------------------------------------------------
 
-# 查询关键词 → 规则文件映射
-_QUERY_RULES_MAP = {
-    "发票": "invoice_rules.txt",
-    "invoice": "invoice_rules.txt",
-    "字段": "invoice_rules.txt",
-    "必填": "invoice_rules.txt",
-    "税号": "invoice_rules.txt",
-    "合规": "invoice_rules.txt",
-    "商品": "product_rules.txt",
-    "一致": "product_rules.txt",
-    "图文": "product_rules.txt",
-    "颜色": "product_rules.txt",
-    "品类": "product_rules.txt",
-    "品牌": "product_rules.txt",
-    "图表": "chart_rules.txt",
-    "chart": "chart_rules.txt",
-    "增长": "chart_rules.txt",
-    "同比": "chart_rules.txt",
-    "计算": "chart_rules.txt",
-    "百分比": "chart_rules.txt",
-}
+# ---- BM25 retrieval over rule documents ----
+
+def _tokenize(text: str) -> List[str]:
+    """Tokenizer: CJK unigrams + whole ASCII words. Avoids English bigram noise."""
+    tokens = []
+    # Split on whitespace to separate English words from CJK text
+    for chunk in text.lower().split():
+        # ASCII words: keep as-is
+        if chunk.isascii():
+            tokens.append(chunk)
+        else:
+            # CJK text: character unigrams
+            tokens.extend(chunk)
+    return tokens
+
+
+class _BM25:
+    """Minimal BM25 scorer for retrieval over small doc sets."""
+    def __init__(self, docs: Dict[str, str], k1: float = 1.2, b: float = 0.75):
+        self.doc_ids = list(docs.keys())
+        self.doc_texts = [docs[k] for k in self.doc_ids]
+        self.k1 = k1
+        self.b = b
+
+        # Tokenize all docs
+        self.doc_tokens = [_tokenize(t) for t in self.doc_texts]
+        self.avgdl = sum(len(t) for t in self.doc_tokens) / max(len(self.doc_tokens), 1)
+
+        # DF (document frequency) for each token
+        self.df: Dict[str, int] = {}
+        for tokens in self.doc_tokens:
+            for token in set(tokens):
+                self.df[token] = self.df.get(token, 0) + 1
+
+        self.N = len(self.doc_ids)
+
+    def score(self, query: str) -> List[tuple]:
+        """Return [(doc_id, score), ...] sorted by descending score."""
+        query_tokens = _tokenize(query)
+        if not query_tokens:
+            return [(did, 0.0) for did in self.doc_ids]
+
+        scores = []
+        for i, tokens in enumerate(self.doc_tokens):
+            doc_len = len(tokens)
+            score = 0.0
+            tf = {}
+            for t in tokens:
+                tf[t] = tf.get(t, 0) + 1
+
+            for qt in query_tokens:
+                if qt not in self.df:
+                    continue
+                # IDF
+                idf = max(0, math.log((self.N - self.df[qt] + 0.5) / (self.df[qt] + 0.5) + 1.0))
+                # TF with saturation
+                tf_q = tf.get(qt, 0)
+                numerator = tf_q * (self.k1 + 1)
+                denominator = tf_q + self.k1 * (1 - self.b + self.b * doc_len / self.avgdl)
+                score += idf * numerator / max(denominator, 1e-8)
+
+            scores.append((self.doc_ids[i], score))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores
+
+
+_bm25_index: _BM25 = None
+
+
+def _get_bm25() -> _BM25:
+    global _bm25_index
+    if _bm25_index is None:
+        rules = _load_rules()
+        if rules:
+            _bm25_index = _BM25(rules)
+    return _bm25_index
 
 
 def retrieve_docs(query: str) -> dict:
     """
     从 data/docs/ 规则文档中检索相关内容。
-    根据查询关键词匹配对应的规则文件，返回完整规则文本。
+    混合策略：关键词快速匹配 + BM25 排序。支持中英文混合查询。
     """
     rules = _load_rules()
-    query_lower = query.lower()
+    if not rules:
+        return {
+            "tool": "retrieve_docs",
+            "query": query,
+            "result": "未找到规则文档（data/docs/ 为空）。",
+        }
 
-    # 匹配规则文件
-    matched_files: set = set()
-    for keyword, filename in _QUERY_RULES_MAP.items():
-        if keyword.lower() in query_lower:
-            matched_files.add(filename)
+    bm25 = _get_bm25()
+    if bm25 is None:
+        return {"tool": "retrieve_docs", "query": query, "result": "BM25 索引构建失败。"}
 
-    if not matched_files:
+    scored = bm25.score(query)
+    max_score = max(s for _, s in scored) if scored else 0
+
+    # Include docs with score >= 30% of max; skip if max is zero (no match)
+    results = []
+    for doc_id, score in scored:
+        if max_score > 0 and score >= max_score * 0.3:
+            results.append(f"[{doc_id}] {rules[doc_id]}")
+
+    if not results:
         return {
             "tool": "retrieve_docs",
             "query": query,
             "result": "未检索到与查询相关的规则文档。",
         }
 
-    # 合并匹配到的规则文档内容
-    results: list[str] = []
-    for filename in sorted(matched_files):
-        if filename in rules:
-            results.append(f"[{filename}] {rules[filename]}")
-
     return {
         "tool": "retrieve_docs",
         "query": query,
-        "result": "\n".join(results) if results else "规则文档为空。",
+        "result": "\n".join(results),
     }
 
 
@@ -136,53 +199,10 @@ _VISION_MODE_PROMPTS = {
 }
 
 
-def _extract_image_index(image: str) -> int:
-    name = Path(image).stem
-    m = re.search(r"(\d+)$", name)
-    return int(m.group(1)) if m else 0
-
-
-def _mock_vision_parse(image: str, mode: str) -> str:
-    """当 VLM 模型不可用时的 mock 回退。返回多样化的模拟结果。"""
-    image_name = Path(image).name.lower()
-    idx = _extract_image_index(image)
-
-    if "invoice" in image_name:
-        base_amount = 100.0 + idx * 47.3
-        has_tax_id = (idx % 3 != 0)
-        tax_part = (
-            f"税号 TAX-2026-{1000 + idx}"
-            if has_tax_id
-            else "未检测到税号字段"
-        )
-        return (
-            f"OCR结果：发票号码 INV-2026-{idx:03d}，"
-            f"日期 2026-{(idx % 12) + 1:02d}-{10 + (idx % 20):02d}，"
-            f"金额 {base_amount:.2f} 元，{tax_part}。"
-        )
-
-    if "chart" in image_name:
-        base_2023 = 70 + idx * 3
-        base_2024 = base_2023 + 8 + idx * 2
-        return f"图表读数：2023={base_2023}，2024={base_2024}。"
-
-    if "product" in image_name:
-        colors = ["黑色", "白色", "红色", "蓝色", "绿色"]
-        categories = ["运动鞋", "T恤", "背包", "手表", "帽子"]
-        color = colors[idx % len(colors)]
-        cat = categories[(idx // len(colors)) % len(categories)]
-        return f"图片内容：{color}{cat}。"
-
-    if "blur" in image_name or "logo" in image_name:
-        return "图片较模糊，无法可靠识别品牌或 logo。"
-
-    return "图片内容无法确定。"
-
-
 def vision_parse(image: str, mode: str = "ocr") -> dict:
     """
     视觉解析工具。支持 OCR / 图像描述 / 图表读数。
-    当 VLM 模型已注入时使用真实推理，否则使用 mock 回退。
+    必须注入真实 VLM 模型，不允许静默 mock 回退。
 
     mode 可选值：
         - "ocr": OCR 文字提取
@@ -192,40 +212,32 @@ def vision_parse(image: str, mode: str = "ocr") -> dict:
     """
     mode = mode or "ocr"
 
-    # 真实 VLM 推理
-    if _vlm_model is not None:
-        try:
-            prompt = _VISION_MODE_PROMPTS.get(
-                mode, _VISION_MODE_PROMPTS["ocr"]
-            )
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-            result_text = _vlm_model.generate(messages)
-            return {
-                "tool": "vision_parse",
-                "mode": mode,
-                "result": result_text.strip(),
-            }
-        except Exception as e:
-            # 真实推理失败时回退到 mock
-            return {
-                "tool": "vision_parse",
-                "mode": mode,
-                "result": f"[真实 VLM 推理失败，使用 mock 结果] {_mock_vision_parse(image, mode)}",
-            }
+    if _vlm_model is None:
+        raise RuntimeError(
+            "vision_parse 需要注入真实 VLM 模型，但当前 _vlm_model 为 None。"
+            "请调用 set_vlm_model() 注入 QwenVLModel 实例。"
+            "禁止在训练/数据构建中使用 mock 回退。"
+        )
 
-    # Mock 回退
+    prompt = _VISION_MODE_PROMPTS.get(mode, _VISION_MODE_PROMPTS["ocr"])
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+    # 使用 generate_vision（禁用 LoRA）避免 agent 格式污染
+    if hasattr(_vlm_model, 'generate_vision'):
+        result_text = _vlm_model.generate_vision(messages)
+    else:
+        result_text = _vlm_model.generate(messages)
     return {
         "tool": "vision_parse",
         "mode": mode,
-        "result": _mock_vision_parse(image, mode),
+        "result": result_text.strip(),
     }
 
 
@@ -233,18 +245,49 @@ def vision_parse(image: str, mode: str = "ocr") -> dict:
 # python_exec：安全数学表达式执行
 # ---------------------------------------------------------------------------
 
-_PYTHON_EXEC_SAFE_RE = re.compile(r"[0-9\.\+\-\*/\(\)\s]+")
+def _safe_eval(code: str) -> float:
+    """
+    AST-whitelist safe expression evaluator.
+    Only allows: numbers, +, -, *, /, (), abs, round, min, max, pow.
+    """
+    import ast
+    import operator
+    import math
+
+    ALLOWED_NODES = {
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.USub,
+    }
+    SAFE_FUNCS = {
+        "abs": abs, "round": round, "min": min, "max": max,
+        "pow": pow, "sqrt": math.sqrt,
+    }
+
+    ALLOWED_NODES.add(ast.Call)
+
+    tree = ast.parse(code.strip(), mode="eval")
+
+    for node in ast.walk(tree):
+        if type(node) not in ALLOWED_NODES:
+            if isinstance(node, ast.Name):
+                if node.id not in SAFE_FUNCS:
+                    raise ValueError(f"禁止使用变量或函数：{node.id}")
+            elif isinstance(node, ast.Call):
+                if not (isinstance(node.func, ast.Name) and node.func.id in SAFE_FUNCS):
+                    raise ValueError(f"禁止调用：{ast.dump(node.func)}")
+            else:
+                raise ValueError(f"禁止的语法节点：{type(node).__name__}")
+
+    # Compile and eval in restricted namespace
+    compiled = compile(tree, "<safe_eval>", "eval")
+    result = eval(compiled, {"__builtins__": {}}, SAFE_FUNCS.copy())
+    return result
 
 
 def python_exec(code: str) -> dict:
+    """安全数学表达式执行（AST 白名单）。"""
     try:
-        if not _PYTHON_EXEC_SAFE_RE.fullmatch(code):
-            return {
-                "tool": "python_exec",
-                "code": code,
-                "result": "拒绝执行：代码包含不安全字符。",
-            }
-        result = eval(code, {"__builtins__": {}}, {})
+        result = _safe_eval(code)
         return {"tool": "python_exec", "code": code, "result": str(result)}
     except Exception as e:
         return {"tool": "python_exec", "code": code, "result": f"执行失败：{e}"}
@@ -271,10 +314,10 @@ def main() -> int:
     print(f"Loaded {len(rules)} rule documents:")
     for name, content in rules.items():
         print(f"  {name}: {content[:80]}...")
-
     print()
 
     # 测试 retrieve_docs
+    print("retrieve_docs smoke test:")
     smoke_queries = [
         "发票缺少税号应该怎么判断？",
         "商品图片和描述是否一致？",
@@ -283,31 +326,19 @@ def main() -> int:
     ]
     for q in smoke_queries:
         result = retrieve_docs(q)
-        print(f"Q: {q}")
-        print(f"   Result: {result['result'][:120]}")
+        print(f"  Q: {q}")
+        print(f"    Result: {result['result'][:120]}")
         print()
 
-    # 测试 vision_parse (mock mode)
-    print("vision_parse (mock mode):")
-    smoke_images = [
-        ("data/images/invoice_001.jpg", "ocr"),
-        ("data/images/chart_001.png", "chart_values"),
-        ("data/images/product_001.jpg", "caption"),
-        ("data/images/logo_001.jpg", "ocr+caption"),
-    ]
-    for img, mode in smoke_images:
-        result = vision_parse(str(ROOT / img), mode)
-        print(f"  {img} ({mode}): {result['result'][:120]}")
-
     # 测试 python_exec
-    print()
+    print("python_exec smoke test:")
     smoke_codes = ["128.50 * 2", "__import__('os').system('dir')", "1/0"]
     for code in smoke_codes:
         result = python_exec(code)
-        print(f"  python_exec({code}): {result['result']}")
+        print(f"  {code}: {result['result']}")
 
-    print(f"\nTools loaded: {', '.join(sorted(TOOLS))}")
-    print(f"VLM model available: {has_vlm_model()}")
+    print(f"\nTools: {', '.join(sorted(TOOLS))}")
+    print(f"vision_parse requires set_vlm_model() before use (no mock fallback).")
     return 0
 
 
